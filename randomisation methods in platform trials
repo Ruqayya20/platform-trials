@@ -1,0 +1,674 @@
+################################################################################
+# File:        platform_trial.R                                                #
+# Author:      Ruqayya Azher (R.A.O.Azher2@newcastle.ac.uk)                    #
+# Description: Code to compare potential randomisation methods in a platform   #
+#              trial                                                           #
+################################################################################
+
+##### INSTALL/LOAD REQUIRED PACKAGES ###########################################
+
+#install.packages("Rfast")
+#install.packages("patchwork")
+#install.packages("tidyverse")
+library(patchwork)
+library(tidyverse)
+
+##### FUNCTIONS ################################################################
+
+# Generates a dataset of patient covariate information
+create_data                  <- function(
+  N = 754, # Total number of patients (before and after adding arm(s))
+  J = 4)   # Number of (binary) covariates
+{
+  data           <-
+    tibble::as_tibble(cbind(matrix(stats::rbinom(N*J, 1, 0.6), N, J), 1L, NA),
+                      .name_repair = "minimal")
+  colnames(data) <- c(paste0("covariate", 1:J), "strata", "treatment")
+  for (j in 1:J) {
+    data$strata  <- data$strata +
+      data[[paste0("covariate", j)]]*as.integer(2^(j - 1))
+  }
+  data
+}
+
+
+# Allocate patients to treatments before the addition of new arm(s)
+randomise_before_adding_arms <- function(
+  K_init   = 1,      # Number of initial experimental arms
+  N        = 754,    # Total number of patients (before and after adding arm(s))
+  J        = 4,      # Number of (binary) covariates
+  time_add = 0.5,    # Proportion of the way through the trial (in terms of N)
+                     # that the new arm(s) are added
+  method   = "SBUD", # Randomisation method to use ("SR", "SBR", "SBUD", "mini")
+  B        = 24,     # Number of balls in active urn initially (if method =
+                     # "SBUD") or block size (if method = "SBR")
+  p        = 0.7)    # Probability of following minimisation's recommendation
+                     # (if method = "mini")
+{
+  data                                         <- create_data(N, J)
+  N1                                           <- as.integer(N*time_add)
+  if (method == "SR") {
+    data$treatment[1:N1]                       <-
+      sample.int(K_init + 1, N1, replace = TRUE) - 1L
+
+  } else if (method == "SBR") {
+    blocks                                     <-
+      matrix(as.vector(sapply(1:(2^J*ceiling(N1/B)),
+                              function(i) {sample(rep(0:K_init, B/(K_init + 1)),
+                                                  B)})), B*ceiling(N1/B), 2^J)
+    
+    for (i in 1:(2^J)) {
+      which_strata_i                           <- which(data$strata[1:N1] == i)
+      data$treatment[which_strata_i]           <-
+        blocks[1:length(which_strata_i), i]
+    }
+  } else if (method == "SBUD") {
+    for (i in 1:(2^J)) {
+      balls_active                             <- rep(B/(K_init + 1),
+                                                      K_init + 1)
+      balls_inactive                           <- numeric(K_init + 1)
+      for (j in which(data$strata[1:N1] == i)) {
+        data$treatment[j]                      <-
+          sample.int(K_init + 1L, 1L, FALSE,
+                     balls_active/sum(balls_active)) - 1L
+        balls_active[data$treatment[j] + 1L]   <-
+          balls_active[data$treatment[j] + 1L] - 1L
+        balls_inactive[data$treatment[j] + 1L] <-
+          balls_inactive[data$treatment[j] + 1L] + 1L
+        if (all(balls_inactive > 0)) {
+          balls_active                         <- balls_active + 1L
+          balls_inactive                       <- balls_inactive - 1L
+        }
+      }
+    }
+  } else if (method == "mini") {
+    burn_in                                    <- ceiling(0.1*N1)
+    covariate_matrix                           <- as.matrix(data[, 1:J])
+    num_matching_covariates                    <- matrix(0, J, K_init + 1)
+    data$treatment[1:burn_in]                  <-
+      sample.int(K_init + 1, burn_in, TRUE) - 1L
+    for (j in (burn_in + 1):N1) {
+      matching_covariates                      <-
+        (covariate_matrix[1:(j - 1), , drop = FALSE] ==
+           matrix(covariate_matrix[j, ], j - 1, J, byrow = TRUE))
+      for (k in 1:(K_init + 1)) {
+        num_matching_covariates[, k]           <-
+          Rfast::colsums(matching_covariates[data$treatment[1:(j - 1)] == k - 1,
+                                             , drop = FALSE])
+      }
+      imbalance                                <- numeric(K_init + 1)
+      for (k in 1:(K_init + 1)) {
+        temp                                   <- num_matching_covariates
+        temp[, k]                              <- temp[, k] + 1
+        range_level                            <-
+          apply(temp%*%diag(1/rep(1, K_init + 1)), 1, range)
+        imbalance[k]                           <-
+          sum(rep(1/J, J)*(range_level[2, ] - range_level[1, ]))
+      }
+      minimizers                               <-
+        (0:K_init)[imbalance == min(imbalance)]
+      len_minimizers                           <- length(minimizers)
+      if (len_minimizers == K_init + 1) {
+        data$treatment[j]                      <- sample.int(K_init + 1, 1) - 1L
+      } else {
+        data$treatment[j]                      <-
+          sample(c(minimizers, (0:K_init)[-(minimizers + 1)]), 1,
+                 prob = c(rep(p/len_minimizers, len_minimizers),
+                          rep((1 - p)/(K_init + 1 - len_minimizers),
+                              K_init + 1 - len_minimizers)))
+      }
+    }
+  }
+  data
+}
+# Test
+data_SR   <- randomise_before_adding_arms(method = "SR")
+data_SBR  <- randomise_before_adding_arms(method = "SBR")
+data_SBUD <- randomise_before_adding_arms(method = "SBUD")
+data_mini <- randomise_before_adding_arms(method = "mini")
+
+# Allocate patients to treatments after the addition of new arm(s)
+randomise_after_adding_arms  <- function(
+  data,                  # Data thus far
+  K_init   = 1,          # Number of initial experimental arms
+  K_new    = 1,          # Number of experimental arms added
+  N        = 754,        # Total number of patients (before and after adding
+                         # arm(s))
+  J        = 4,          # Number of (binary) covariates
+  time_add = 0.5,        # Proportion of the way through the trial (in terms of
+                         # N) that the new arm(s) are added
+  method   = "mini",     # Randomisation method to use ("SR", "SBR", "SBUD",
+                         # or "mini")
+  B        = 24,         # Number of balls in active urn initially (if method =
+                         # "SBUD") or block size (if method = "SBR")
+  p        = 0.7,        # Probability of following minimisation's
+                         # recommendation (if method = "mini")
+  ratio    = c(2, 1, 3), # Allocation ratios after the new arm(s) have been
+                         # added
+  use_data = FALSE)      # Use the data from before the new arms were added in
+                         # determining future assignments (if method = "mini")
+{
+  K                                                 <- K_init + K_new
+  N1                                                <- as.integer(N*time_add)
+  N2                                                <- N - N1 
+  if (method == "SR") {
+    data$treatment[(N1 + 1):N]                      <-
+      sample.int(K + 1, N2, replace = TRUE, prob = ratio/sum(ratio)) - 1L
+  } else if (method == "SBR") {
+    blocks                                          <-
+      matrix(as.vector(sapply(1:(2^J*ceiling(N2/B)),
+                              function(i) {sample(rep(0:K, B*ratio/sum(ratio)),
+                                                      B)})),
+             B*ceiling(N2/B), 2^J)
+    for (i in 1:(2^J)) {
+      which_strata_i                                <-
+        which(data$strata[(N1 + 1):N] == i)
+      data$treatment[(N1 + 1):N][which_strata_i]    <-
+        blocks[1:length(which_strata_i), i]
+    }
+  } else if (method == "SBUD") {
+    for (i in 1:(2^J)) {
+      balls_active                                  <- B*ratio/sum(ratio)
+      balls_inactive                                <- numeric(K + 1)
+      for (j in which(data$strata[(N1 + 1):N] == i)) {
+        data$treatment[N1 + j]                      <-
+          sample.int(K + 1, 1, prob = balls_active/sum(balls_active)) - 1L
+        balls_active[data$treatment[N1 + j] + 1L]   <-
+          balls_active[data$treatment[N1 + j] + 1L] - 1L
+        balls_inactive[data$treatment[N1 + j] + 1L] <-
+          balls_inactive[data$treatment[N1 + j] + 1L] + 1L
+        if (all(balls_inactive >= ratio)) {
+          balls_active                              <- balls_active + ratio
+          balls_inactive                            <- balls_inactive - ratio
+        }
+      }
+    }
+  } else if (method == "mini") {
+    covariate_matrix                                <- as.matrix(data[, 1:J])
+    num_matching_covariates                         <- matrix(0, J, K + 1)
+    if (use_data) {
+      match_start                                   <- 1
+      burn_in                                       <- 0
+    } else {
+      match_start                                   <- N1 + 1
+      burn_in                                       <- ceiling(0.1*N2)
+      data$treatment[N1 + (1:burn_in)]              <-
+        sample.int(K + 1, burn_in, TRUE, prob = ratio/sum(ratio)) - 1L
+    }
+    for (j in (N1 + burn_in + 1):N) {
+      matching_covariates                           <-
+        (covariate_matrix[match_start:(j - 1), , drop = FALSE] ==
+           matrix(covariate_matrix[j, ], j - match_start, J, byrow = TRUE))
+      for (k in 1:(K + 1)) {
+        num_matching_covariates[, k]                <- Rfast::colsums(
+          matching_covariates[data$treatment[match_start:(j - 1)] == k - 1, ,
+                              drop = FALSE])
+      }
+      imbalance                                     <- numeric(K + 1) 
+      for (k in 1:(K + 1)) {
+        temp                                        <- num_matching_covariates
+        temp[, k]                                   <- temp[, k] + 1
+        range_level                                 <-
+          apply(temp%*%diag(1/ratio), 1, range) 
+        imbalance[k]                                <-
+          sum(rep(1/J, J)*(range_level[2, ] - range_level[1, ]))
+      }
+      minimizers                                    <-
+        (0:K)[imbalance == min(imbalance)]
+      len_minimizers                                <- length(minimizers)
+      if (len_minimizers == K + 1) {
+        data$treatment[j]                           <- sample.int(K + 1, 1) - 1L
+      } else {
+        data$treatment[j]                           <-
+          sample(c(minimizers, (0:K)[-(minimizers + 1)]), 1,
+                 prob = c(rep(p/len_minimizers, len_minimizers),
+                          rep((1 - p)/(K + 1 - len_minimizers),
+                              K + 1 - len_minimizers)))
+      }
+    }
+  }
+  data
+}
+# Test
+data_SR_final   <- randomise_after_adding_arms(data_SR, method = "SR")
+data_SBR_final  <- randomise_after_adding_arms(data_SBR, method = "SBR")
+data_SBUD_final <- randomise_after_adding_arms(data_SBUD, method = "SBUD")
+data_mini_final <- randomise_after_adding_arms(data_mini, method = "mini")
+
+# Calculate the covariate imbalance over time between the control arm and each
+# of the experimental arms in a single trial
+get_imbalance                <- function(data) {
+  N                                        <- nrow(data)
+  J                                        <- ncol(data) - 2
+  K                                        <- max(data$treatment)
+  imbalance                                <-
+    rep(list(matrix(0, N, J,
+                    dimnames = list(NULL, paste0("covariate", 1:J)))), K)
+  n                                        <- numeric(K + 1)
+  for (i in 1:N) {
+    n[data$treatment[i] + 1L]              <- n[data$treatment[i] + 1L] + 1L
+    for (j in 1:J) {
+      covariates_j0                        <- data[c(data$treatment[1:i] == 0,
+                                                     rep(FALSE, N - i)), j]
+      for (k in 1:K) {
+        covariates_jk                      <- data[c(data$treatment[1:i] == k,
+                                                     rep(FALSE, N - i)), j]
+        imbalance[[k]][i, j]               <-
+          abs(sum(covariates_jk == 1)/n[k + 1L] - sum(covariates_j0 == 1)/n[1L])
+      }
+    }
+  }
+  for (k in 1:K) {
+    imbalance[[k]][is.nan(imbalance[[k]])] <- NA
+  }
+  # Use the maximum covariate imbalance for each arm
+  output                                   <- cbind(1:N, matrix(0, N, K))
+  colnames(output)                         <-
+    c("n", paste("Imbalance: Treatment", 1:K))
+  for (k in 1:K) {
+    output[, k + 1]                        <- apply(imbalance[[k]], 1,
+                                                    function(x) max(x))
+  }
+  tibble::as_tibble(output)
+}
+# Test
+imbalance_SR   <- get_imbalance(data_SR_final)
+imbalance_SBR  <- get_imbalance(data_SBR_final)
+imbalance_SBUD <- get_imbalance(data_SBUD_final)
+imbalance_mini <- get_imbalance(data_mini_final)
+
+# Calculate the predictability over time in a single trial
+get_predictability <- function(data, K_init = 1, K_new = 1, ratio = c(2,1,3), time_add = 0.5) {
+  N                            <- nrow(data)
+  N1                           <- as.integer(N*time_add)
+  K                            <- K_init + K_new
+  n                            <- n2 <- numeric(K + 1)
+  guess                        <- numeric(N)
+  guess2                       <- numeric(N - N1)
+  guess[1]                     <- sample(0:K_init, 1)
+  for (i in 1:N1) {
+    n[data$treatment[i] + 1L]  <- n[data$treatment[i] + 1L] + 1L
+    minimizer                  <- (0:K_init)[which(n[1:(K_init + 1)] ==
+                                                     min(n[1:(K_init + 1)]))]
+    if (length(minimizer) == 1) {
+      guess[i + 1L]            <- minimizer
+    } else {
+      guess[i + 1L]            <- sample(minimizer, 1)
+    }
+  }
+  guess2[1]                    <- sample(0:K, 1)
+  for (i in (N1 + 1):(N - 1)) {
+    n[data$treatment[i] + 1L]  <- n[data$treatment[i] + 1L] + 1L
+    n2[data$treatment[i] + 1L] <- n2[data$treatment[i] + 1L] + 1L
+    minimizer                  <- (0:K)[which(n/ratio == min(n/ratio))]
+    if (length(minimizer) == 1) {
+      guess[i + 1L]            <- minimizer
+    } else {
+      guess[i + 1L]            <- sample(minimizer, 1)
+    }
+    minimizer2                 <- (0:K)[which(n2/ratio == min(n2/ratio))]
+    if (length(minimizer2) == 1) {
+      guess2[i + 1L - N1]      <- minimizer2
+    } else {
+      guess2[i + 1L - N1]      <- sample(minimizer2, 1)
+    }
+  }
+  tibble::tibble(n      = 1:N,
+                 `Predictability: Stage 1`     =
+                   c(cumsum(guess[1:N1] == data$treatment[1:N1])/(1:N1),
+                     rep(NA, N - N1)),
+                 `Predictability: Stage 2`     =
+                   c(rep(NA, N1),
+                     cumsum(guess2[1:(N - N1)] ==
+                              data$treatment[(N1 + 1):N])/(1:(N - N1))),
+                 `Predictability: Both stages` =
+                   cumsum(guess == data$treatment)/(1:N))
+}
+# Test
+predictability_SR   <- get_predictability(data_SR_final)
+predictability_SBR  <- get_predictability(data_SBR_final)
+predictability_SBUD <- get_predictability(data_SBUD_final)
+predictability_mini <- get_predictability(data_mini_final)
+
+#write.csv(predictability_mini, file = "predictability_mini.csv") 
+#write.csv(predictability_SBUD, file = "predictability_SBUD.csv") 
+
+# Simulate a single trial and return the performance criteria
+get_sim <- function(
+  K_init   = 1,          # Number of initial experimental arms
+  K_new    = 1,          # Number of experimental arms added
+  N        = 754,        # Total number of patients (before and after adding
+                         # arm(s))
+  J        = 4,          # Number of (binary) covariates
+  time_add = 0.5,        # Proportion of the way through the trial (in terms of
+                         # N) that the new arm(s) are added
+  method   = "mini",     # Randomisation method to use ("SR", "SBR", "SBUD",
+                         # or "mini")
+  B        = 24,         # Number of balls in active urn initially (if method =
+                         # "SBUD") or block size (if method = "SBR")
+  p        = 0.7,        # Probability of following minimisation's
+                         # recommendation (if method = "mini")
+  ratio    = c(2, 1, 3), # Allocation ratios after the new arm(s) have been
+                         # added
+  use_data = FALSE)      # Use the data from before the new arms were added in
+                         # determining future assignments (if method = "mini")
+{
+  data           <- randomise_before_adding_arms(K_init, N, J, time_add, method,
+                                                 B, p)
+  data           <- randomise_after_adding_arms(data, K_init, K_new, N, J,
+                                                time_add, method, B, p, ratio,
+                                                use_data)
+  imbalance      <- get_imbalance(data)
+  predictability <- get_predictability(data, K_init, K_new, ratio, time_add)
+  dplyr::bind_cols(imbalance, predictability[, -1])
+}
+# Test
+sim_SR   <- get_sim(method = "SR")
+sim_SBR  <- get_sim(method = "SBR")
+sim_SBUD <- get_sim(method = "SBUD")
+sim_mini <- get_sim(method = "mini")
+
+# Simulate a large number of trials and return the average performance criteria
+get_sims  <- function(
+  sims     = 1000,      # Number of simulation replicates
+  K_init   = 1,          # Number of initial experimental arms
+  K_new    = 1,          # Number of experimental arms added
+  N        = 754,        # Total number of patients (before and after adding
+                         # arm(s))
+  J        = 4,          # Number of (binary) covariates
+  time_add = 0.5,        # Proportion of the way through the trial (in terms of
+                         # N) that the new arm(s) are added
+  method   = "mini",     # Randomisation method to use ("SR", "SBR", "SBUD",
+                         # or "mini")
+  B        = 24,         # Number of balls in active urn initially (if method =
+                         # "SBUD") or block size (if method = "SBR")
+  p        = 0.7,        # Probability of following minimisation's
+                         # recommendation (if method = "mini")
+  ratio    = c(2, 1, 3), # Allocation ratios after the new arm(s) have been
+                         # added
+  use_data = FALSE,      # Use the data from before the new arms were added in
+                         # determining future assignments (if method = "mini")
+  seed     = 1)          # Seed for reproducibility
+{
+  set.seed(seed)
+  results        <- list()
+  for (i in 1:sims) {
+    results[[i]] <- get_sim(K_init, K_new, N, J, time_add, method, B, p, ratio,
+                            use_data)
+  }
+  dplyr::bind_rows(results) %>% 
+    dplyr::group_by(n) %>% 
+      dplyr::summarise_all(mean, na.rm = TRUE)
+}
+# Test
+sims_SR   <- get_sims(sims = 1, method = "SR")
+sims_SBR  <- get_sims(sims = 1, method = "SBR")
+sims_SBUD <- get_sims(sims = 1, method = "SBUD")
+sims_mini <- get_sims(sims = 1, method = "mini")
+####################################################
+######this is the part 2
+
+get_sims  <- function(
+  sims     = 10000,      # Number of simulation replicates
+  K_init   = 1,          # Number of initial experimental arms
+  K_new    = 1,          # Number of experimental arms added
+  N        = 754,        # Total number of patients (before and after adding
+                         # arm(s))
+  J        = 4,          # Number of (binary) covariates
+  time_add = 0.5,        # Proportion of the way through the trial (in terms of
+                         # N) that the new arm(s) are added
+  method   = "mini",     # Randomisation method to use ("SR", "SBR", "SBUD",
+                         # or "mini")
+  B        = 24,         # Number of balls in active urn initially (if method =
+                         # "SBUD") or block size (if method = "SBR")
+  p        = 0.7,        # Probability of following minimisation's
+                         # recommendation (if method = "mini")
+  ratio    = c(3,1,2), # Allocation ratios after the new arm(s) have been
+                         # added
+  use_data = FALSE,      # Use the data from before the new arms were added in
+                         # determining future assignments (if method = "mini")
+  seed     = 1)          # Seed for reproducibility
+{
+  set.seed(seed)
+  results        <- list()
+  for (i in 1:sims) {
+    results[[i]] <- get_sim(K_init, K_new, N, J, time_add, method, B, p, ratio,
+                            use_data)
+  }
+  dplyr::bind_rows(results) %>% 
+    dplyr::group_by(n) %>% 
+      dplyr::summarise_all(mean, na.rm = TRUE)
+}
+# Test
+sims_SR        <- get_sims(sims = 10000, method = "SR")
+sims_SBR       <- get_sims(sims = 10000, method = "SBR")
+sims_SBUD      <- get_sims(sims = 10000, method = "SBUD")
+sims_mini      <- get_sims(sims = 10000, method = "mini")
+
+
+
+
+data32nn   <- dplyr::bind_rows(sims_SBR, 
+                            sims_SBUD)%>%
+  dplyr::mutate(Method = rep(c("SBR", "SBUD"), each = 754))
+
+ratio <- "3:1:2"
+data32nn$ratio <- ratio
+
+write.csv(data32nn, file = "data32nn.csv")
+
+
+
+
+###############################################
+data13   <- dplyr::bind_rows(sims_SR, sims_SBR, 
+                              sims_SBUD, sims_mini)%>%
+  dplyr::mutate(Method = rep(c("SR", "SBR", "SBUD", "Mini"), each = 754)) 
+
+
+ratio <- "1:1:3"
+data13$ratio <- ratio
+
+write.csv(data13, file = "data13.csv") 
+
+
+
+
+dataset3 <- dplyr::bind_rows(data11, data12, data13, 
+                             data21,data22,data23,data32)
+
+write.csv(dataset3, file = "dataset3.csv") 
+##################################################################
+
+
+# Plotting
+
+data   <- dplyr::bind_rows(sims_SBUD_13, sims_mini_13)%>%
+  dplyr::mutate(Method = rep(c("SBUD", "Mini"), each = 754))
+
+#data                <- dplyr::bind_rows(sims_SR_7, sims_SBR_7, sims_SBUD_7,
+ #                                       sims_mini_7) %>%
+data   <- dplyr::bind_rows(sims_SR, sims_SBR, 
+                                        sims_SBUD, sims_mini)%>%
+  dplyr::mutate(Method = rep(c("SR", "SBR", "SBUD", "Mini"), each = 100))
+
+ratio <- "1:1:2"
+data_12$ratio <- ratio
+
+
+write.csv(data_21, file = "data_21.csv")
+
+
+data6<- data6%>% 
+  dplyr::mutate(Method = rep(c("SR", "SBR", "SBUD", "Mini"), each = 100))
+
+#ratio <- "3:1:2"
+#data6$ratio <- ratio
+
+#res_all <- rbind(res, data6)
+
+write.csv(data_13, file = "data_13.csv") 
+
+###############################################################
+data_F$ratio <- as.character(data_F$ratio)
+data_F$ratio<-gsub("0","",as.character(data_F$ratio))
+
+
+data                <- dplyr::bind_rows(sims_SR, sims_SBR, sims_SBUD,
+                                        sims_mini) %>%
+  dplyr::mutate(Method = rep(c("SR", "SBR", "SBUD", "Mini"), each = 100))
+
+
+data_imbalance      <- tidyr::pivot_longer(
+  dataset1, `Imbalance: Treatment 1`:`Imbalance: Treatment 2`) %>%
+  dplyr::mutate(name = dplyr::recode_factor(
+    name,
+    `Imbalance: Treatment 1` = "1",
+    `Imbalance: Treatment 2` = "2"))
+
+p_imbalance         <- ggplot2::ggplot(data_imbalance,
+                                       ggplot2::aes(x        = n,
+                                                    y        = value,
+                                                    colour   = Method,
+                                                    linetype = name)) +
+  ggplot2::geom_line() +
+  ggplot2::theme_bw() +
+  ggplot2::labs(x        = "Sample size",
+                y        = "Maximum imbalance over all covariates",
+                linetype = "Treatment arm") +
+  ggplot2::theme(legend.position = "bottom") +
+  facet_wrap(~ratio)
+
+data_predictability <- tidyr::pivot_longer(
+  data13, `Predictability: Stage 1`:`Predictability: Stage 2`) %>%
+  dplyr::mutate(name = dplyr::recode_factor(
+    name,
+    `Predictability: Stage 1` = "1",
+    `Predictability: Stage 2` = "2"))
+
+p_predictability <- ggplot2::ggplot(data_predictability,
+                                    ggplot2::aes(x        = n,
+                                                 y        = `Predictability: Both stages`,
+                                                 colour   = Method)) +
+  ggplot2::geom_line() +
+ # scale_x_continuous(breaks = c(0, 30,60,90,120,150,180)) +
+  scale_y_continuous(breaks = c(0.00,0.10,0.20, 0.30,0.40,0.50,0.60,0.70,0.80)) +
+  ggplot2::theme_bw()  +
+  ggplot2::labs(x        = "Sample size",
+                y        = "Predictability",
+                linetype = "Stage") +
+  ggplot2::theme(legend.position = "bottom") #+
+  #facet_wrap(~ratio)
+
+ggsave("dataset1.png", p_imbalance, width = 13, height = 15, units = c("in"), dpi = 600) 
+
+############################
+data_full_1$`Predictability: Stage 1`= as.numeric(data_full_1$`Predictability: Stage 1`)
+data_full_1$`Predictability: Stage 2`= as.numeric(data_full_1$`Predictability: Stage 2`)
+
+###############################################################
+#graph for SC2 
+dataset22 <- dataset2$`Imbalance: Treatment 2` <- pmax(dataset2$`Imbalance: Treatment 1`, dataset2$`Imbalance: Treatment 2`)
+write.csv(dataset22, file = "dataset22.csv") 
+
+data_imbalance      <- tidyr::pivot_longer(
+  dataset2, `Imbalance: Treatment 2`:`Imbalance: Treatment 3`) %>%
+  dplyr::mutate(name = dplyr::recode_factor(
+    name,
+    `Imbalance: Treatment 2` = "Initial arms",
+    `Imbalance: Treatment 3` = "New arm"))
+
+
+p_imbalance         <- ggplot2::ggplot(data_imbalance,
+                                       ggplot2::aes(x        = n,
+                                                    y        = value,
+                                                    colour   = Method,
+                                                    linetype = name)) +
+  scale_x_continuous(breaks = c(0, 125, 250, 375,500,625, 750)) +
+  scale_y_continuous(breaks = c(0.00,0.10,0.20, 0.30,0.40,0.50,0.60,0.70,0.80)) +
+  ggplot2::geom_line(size = 0.6) +
+  ggplot2::theme_bw() +
+  ggplot2::labs(x        = "Sample size",
+                y        = "Maximum imbalance over all covariates",
+                linetype = "Treatment arm") +
+  ggplot2::theme(legend.position = "bottom", text = element_text(size = 18)) + 
+  facet_wrap(~ratio)
+
+ggsave("dataset2.png", p_imbalance, width = 13, height = 15, units = c("in"), dpi = 600) 
+
+
+data_predictability <- tidyr::pivot_longer(
+  dataset1, `Predictability: Stage 1`:`Predictability: Stage 2`) %>%
+  dplyr::mutate(name = dplyr::recode_factor(
+    name,
+    `Predictability: Stage 1` = "1",
+    `Predictability: Stage 2` = "2"))
+
+p_predictability <- ggplot2::ggplot(data_predictability,
+                                    ggplot2::aes(x        = n,
+                                                 y        = value,
+                                                 colour   = Method,
+                                                 linetype = name)) + 
+  scale_x_continuous(breaks = c(0, 125, 250, 375,500,625, 750)) +
+  scale_y_continuous(limits=c(0.3, 0.6)) +
+  ggplot2::geom_line(size = 0.6) +
+  ggplot2::theme_bw() +
+  ggplot2::labs(x        = "Sample size",
+                y        = "Predictability",
+                linetype = "Stage") +
+  ggplot2::theme(legend.position = "bottom", text = element_text(size = 18)) +
+  facet_wrap(~ratio)
+
+ggsave("correct_guess.png", p_predictability, width = 13, height = 15, units = c("in"), dpi = 600) 
+
+##########################################
+
+#Graph for SC3 (considering the previous assignment)
+
+dataset3 <- dplyr::bind_rows( data12n, data13n, 
+                                       data21n, data23n, data32n)
+
+data_imbalance      <- tidyr::pivot_longer(
+  dataset3, `Imbalance: Treatment 1`:`Imbalance: Treatment 2`) %>%
+  dplyr::mutate(name = dplyr::recode_factor(
+    name,
+    `Imbalance: Treatment 1` = "1",
+    `Imbalance: Treatment 2` = "2"))
+
+p_imbalance         <- ggplot2::ggplot(data_imbalance,
+                                       ggplot2::aes(x        = n,
+                                                    y        = value,
+                                                    colour   = Method,
+                                                    linetype = name)) +
+  scale_x_continuous(breaks = c(0, 125, 250, 375,500,625, 750)) +
+  scale_y_continuous(breaks = c(0.00,0.10,0.20, 0.30,0.40,0.50,0.60,0.70,0.80)) +
+  ggplot2::geom_line() +
+  ggplot2::theme_bw() +
+  ggplot2::labs(x        = "Sample size",
+                y        = "Maximum imbalance over all covariates",
+                linetype = "Treatment arm") +
+  ggplot2::theme(legend.position = "bottom") +
+  facet_wrap(~ratio)
+
+data_predictability <- tidyr::pivot_longer(
+  dataset3, `Predictability: Stage 1`:`Predictability: Stage 2`) %>%
+  dplyr::mutate(name = dplyr::recode_factor(
+    name,
+    `Predictability: Stage 1` = "1",
+    `Predictability: Stage 2` = "2"))
+
+p_predictability <- ggplot2::ggplot(data_predictability,
+                                    ggplot2::aes(x        = n,
+                                                 y        = `Predictability: Both stages`,
+                                                 colour   = Method)) +
+  ggplot2::geom_line() +
+  scale_x_continuous(breaks = c(0, 125, 250, 375,500,625, 750))+
+  scale_y_continuous(breaks = c(0.00,0.10,0.20, 0.30,0.40,0.50,0.60,0.70,0.80)) +
+  ggplot2::theme_bw()  +
+  ggplot2::labs(x        = "Sample size",
+                y        = "Predictability") +
+  ggplot2::theme(legend.position = "bottom") +
+  facet_wrap(~ratio)
+
+ggsave("correct_guess3.png", p_predictability, width = 13, height = 15, units = c("in"), dpi = 600) 
+
